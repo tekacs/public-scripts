@@ -120,8 +120,8 @@ fn find_scripts(repo_dir: &Path, filter: Option<&[String]>) -> Result<Vec<PathBu
             let entry = entry?;
             let path = entry.path();
             
-            // Skip directories and the install script itself
-            if path.is_file() && path.file_name() != Some("install".as_ref()) {
+            // Skip directories
+            if path.is_file() {
                 // Check if it's executable
                 if let Ok(metadata) = fs::metadata(&path) {
                     use std::os::unix::fs::PermissionsExt;
