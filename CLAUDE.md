@@ -23,9 +23,10 @@ This is a collection of personal utility scripts written in Rust using scriptr. 
   // Rust code starts here
   ```
 - Scripts use the shebang `#!/usr/bin/env scriptr`
-- All scripts must be executable (`chmod +x scriptname`)
-- Scripts live in the repository root, not in subdirectories
-- Scripts can have any name (no .rs extension required)
+- All scripts must be executable (`chmod +x scriptname.rs`)
+- Scripts are stored with `.rs` extension in the repository for better editor support
+- Scripts live in the repository root or `meta/` subdirectory
+- When installed, scripts are symlinked without the `.rs` extension for cleaner command names
 
 ### Shell Completions
 - Completion files go in `completions/` directory
@@ -33,23 +34,23 @@ This is a collection of personal utility scripts written in Rust using scriptr. 
 - Completions are optional but encouraged for better UX
 
 ### The Install Script
-The `meta/install` script is special - it manages installation of all other scripts:
-- Symlinks scripts from this repo to a target directory (default: ~/bin)
+The `meta/install.rs` script is special - it manages installation of all other scripts:
+- Symlinks scripts from this repo to a target directory (default: ~/bin), removing the `.rs` extension
 - Installs shell completions to appropriate directories
 - Validates existing symlinks point to this repo
-- Supports selective installation: `./meta/install scriptname`
-- Includes dry-run mode: `./meta/install --dry-run`
+- Supports selective installation: `./meta/install.rs scriptname`
+- Includes dry-run mode: `./meta/install.rs --dry-run`
 
 ### Building and Testing
 Scripts are compiled on-demand by scriptr, so there's no build process. To test a script:
 ```bash
-./scriptname args
+./scriptname.rs args
 ```
 
 First run will be slower as dependencies are compiled. Subsequent runs are cached and fast (~5ms).
 
 ### Adding New Scripts
-1. Create executable script file in repo root
+1. Create executable script file with `.rs` extension in repo root or `meta/`
 2. Add scriptr shebang and dependencies front matter
 3. Optionally create completion files in `completions/`
-4. Run `./meta/install` to symlink to ~/bin
+4. Run `./meta/install.rs` to symlink to ~/bin (without .rs extension)

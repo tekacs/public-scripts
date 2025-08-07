@@ -96,37 +96,51 @@ fn find_scripts(repo_dir: &Path, filter: Option<&[String]>) -> Result<Vec<PathBu
     let mut scripts = Vec::new();
     
     if let Some(names) = filter {
-        // Find specific scripts by name
+        // Find specific scripts by name (with or without .rs extension)
         for name in names {
-            let path = repo_dir.join(name);
-            if !path.exists() {
-                bail!("Script '{}' not found in {}", name, repo_dir.display());
-            }
+            // Try with .rs extension first
+            let path_with_rs = repo_dir.join(format!("{}.rs", name));
+            let path_without_rs = repo_dir.join(name);
+            
+            let path = if path_with_rs.exists() {
+                path_with_rs
+            } else if path_without_rs.exists() && path_without_rs.extension().map_or(false, |e| e == "rs") {
+                path_without_rs
+            } else {
+                bail!("Script '{}' not found in {} (looked for {}.rs)", name, repo_dir.display(), name);
+            };
+            
             if !path.is_file() {
-                bail!("'{}' is not a file", name);
+                bail!("'{}' is not a file", path.display());
             }
             // Check if it's executable
             if let Ok(metadata) = fs::metadata(&path) {
                 use std::os::unix::fs::PermissionsExt;
                 if metadata.permissions().mode() & 0o111 == 0 {
-                    bail!("'{}' is not executable", name);
+                    bail!("'{}' is not executable", path.display());
                 }
             }
             scripts.push(path);
         }
     } else {
-        // Find all executable scripts
-        for entry in fs::read_dir(repo_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            
-            // Skip directories
-            if path.is_file() {
-                // Check if it's executable
-                if let Ok(metadata) = fs::metadata(&path) {
-                    use std::os::unix::fs::PermissionsExt;
-                    if metadata.permissions().mode() & 0o111 != 0 {
-                        scripts.push(path);
+        // Find all executable .rs scripts and also check meta/ subdirectory
+        let dirs_to_check = vec![repo_dir.to_path_buf(), repo_dir.join("meta")];
+        
+        for dir in dirs_to_check {
+            if dir.exists() {
+                for entry in fs::read_dir(&dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    
+                    // Only include .rs files that are executable
+                    if path.is_file() && path.extension().map_or(false, |e| e == "rs") {
+                        // Check if it's executable
+                        if let Ok(metadata) = fs::metadata(&path) {
+                            use std::os::unix::fs::PermissionsExt;
+                            if metadata.permissions().mode() & 0o111 != 0 {
+                                scripts.push(path);
+                            }
+                        }
                     }
                 }
             }
@@ -158,44 +172,65 @@ fn validate_existing_symlink(link_path: &Path, expected_target: &Path) -> Result
 }
 
 fn install_script(script: &Path, bin_dir: &Path, force: bool, dry_run: bool) -> Result<()> {
-    let script_name = script.file_name().unwrap();
-    let link_path = bin_dir.join(script_name);
+    let script_name_full = script.file_name().unwrap().to_string_lossy();
+    // Remove .rs extension for the symlink name
+    let link_name = if script_name_full.ends_with(".rs") {
+        &script_name_full[..script_name_full.len() - 3]
+    } else {
+        &script_name_full
+    };
+    let link_path = bin_dir.join(link_name);
     
-    if !validate_existing_symlink(&link_path, script)? {
-        if link_path.is_symlink() {
-            if force {
-                if !dry_run {
-                    fs::remove_file(&link_path)?;
-                }
-                println!("   {} {} {}", 
-                    "🔄".yellow(), 
-                    script_name.to_string_lossy().bold(),
-                    "(replacing incorrect symlink)".dimmed()
-                );
+    // Check what's at the target location
+    if link_path.is_symlink() {
+        // It's a symlink - validate it points to the right place
+        if let Ok(target) = fs::read_link(&link_path) {
+            let canonical_target = if target.is_relative() {
+                link_path.parent().unwrap().join(&target).canonicalize().ok()
             } else {
-                bail!("Symlink {} exists but points to wrong location. Use --force to overwrite.", 
-                    link_path.display());
+                target.canonicalize().ok()
+            };
+            let canonical_expected = script.canonicalize().ok();
+            
+            if canonical_target.is_some() && canonical_target == canonical_expected {
+                // Symlink is correct
+                println!("   {} {} {}", 
+                    "✓".green().dimmed(), 
+                    link_name.dimmed(),
+                    "(already installed)".dimmed()
+                );
+                return Ok(());
             }
-        } else {
-            bail!("Regular file exists at {}. Cannot create symlink.", link_path.display());
         }
-    } else if link_path.exists() {
+        
+        // Symlink is broken or points to wrong location, update it
+        if !dry_run {
+            fs::remove_file(&link_path)?;
+        }
         println!("   {} {} {}", 
-            "✓".green().dimmed(), 
-            script_name.to_string_lossy().dimmed(),
-            "(already installed)".dimmed()
+            "🔄".yellow(), 
+            link_name.bold(),
+            "(updating symlink)".dimmed()
         );
-        return Ok(());
+    } else if link_path.exists() {
+        // It's a regular file or directory - can't overwrite
+        bail!("Regular file exists at {}. Cannot create symlink. Use --force to overwrite.", 
+            link_path.display());
     }
     
+    // Create the symlink
     if !dry_run {
-        symlink(script, &link_path)?;
+        symlink(script, &link_path)
+            .with_context(|| format!("Failed to create symlink from {} to {}", 
+                link_path.display(), script.display()))?;
     }
     
-    println!("   {} {}", 
-        if dry_run { "→" } else { "✓" }.green().bold(), 
-        script_name.to_string_lossy().bold()
-    );
+    if !link_path.is_symlink() || dry_run {
+        println!("   {} {}", 
+            if dry_run { "→" } else { "✓" }.green().bold(), 
+            link_name.bold()
+        );
+    }
     
     Ok(())
 }
@@ -335,7 +370,12 @@ fn main() -> Result<()> {
                             let script_name = name.trim_end_matches(&format!(".{}", shell_name));
                             let script_exists = scripts.iter().any(|s| {
                                 s.file_name()
-                                    .map(|n| n.to_string_lossy() == script_name)
+                                    .map(|n| {
+                                        let name_str = n.to_string_lossy();
+                                        // Match either exact name or name.rs
+                                        name_str == script_name || 
+                                        name_str == format!("{}.rs", script_name)
+                                    })
                                     .unwrap_or(false)
                             });
                             

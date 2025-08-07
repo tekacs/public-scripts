@@ -11,7 +11,7 @@ This README is maintained by AI. I do review the scripts though.
 ```bash
 git clone https://github.com/amar/public-scripts
 cd public-scripts
-./meta/install
+./meta/install.rs
 ```
 
 The install script will:
@@ -22,11 +22,11 @@ The install script will:
 ### Install Options
 
 ```bash
-./meta/install --help                 # Show all options
-./meta/install --dry-run              # Preview what would be installed
-./meta/install z                      # Install only specific scripts
-./meta/install --shell fish           # Override shell detection
-./meta/install --bin-dir ~/.local/bin # Custom install directory
+./meta/install.rs --help                 # Show all options
+./meta/install.rs --dry-run              # Preview what would be installed
+./meta/install.rs z                      # Install only specific scripts
+./meta/install.rs --shell fish           # Override shell detection
+./meta/install.rs --bin-dir ~/.local/bin # Custom install directory
 ```
 
 ## Available Scripts
@@ -65,9 +65,9 @@ fn main() {
 }
 ```
 
-1. Create an executable script in the repo root
+1. Create an executable script with `.rs` extension in the repo root
 2. Add optional completions in `completions/scriptname.{fish,bash,zsh}`
-3. Run `./meta/install` to symlink it
+3. Run `./meta/install.rs` to symlink it (installed without .rs extension)
 
 ## License
 
