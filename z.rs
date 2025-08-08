@@ -302,6 +302,61 @@ fn parse_session_tabs(session: &SessionInfo) -> Result<Vec<TabInfo>> {
     }
 }
 
+fn check_dead_session(name: &str) -> Result<Option<SessionInfo>> {
+    // List all sessions including exited ones
+    let all_sessions = list_sessions(true)?;
+    
+    // Find a dead session with the given name
+    Ok(all_sessions.into_iter()
+        .find(|s| s.name == name && s.is_exited))
+}
+
+fn resurrect_dead_session(name: &str) -> Result<()> {
+    println!("{}: Resurrecting dead session '{}'", "Info".blue(), name.green());
+    
+    // Try to attach to the dead session, which should resurrect it
+    let result = cmd!("zellij", "attach", name)
+        .run();
+    
+    match result {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            // The attach might fail in non-terminal environments but still resurrect the session
+            // Check if the session is now active
+            let active_sessions = list_sessions(false)?;
+            if active_sessions.iter().any(|s| s.name == name && !s.is_exited) {
+                // Session was successfully resurrected despite the error
+                println!("{}: Session '{}' has been resurrected", "Success".green(), name.green());
+                println!("Use '{}' to attach to it", format!("z {}", name).cyan());
+                Ok(())
+            } else {
+                // Session is still dead, offer to delete and recreate
+                println!("{}: Session appears to be corrupted.", "Warning".yellow());
+                print!("Would you like to delete it and create a new one? [Y/n] ");
+                io::stdout().flush()?;
+                
+                let mut response = String::new();
+                io::stdin().read_line(&mut response)?;
+                let response = response.trim().to_lowercase();
+                
+                if response.is_empty() || response == "y" || response == "yes" {
+                    // Delete the dead session
+                    println!("{}: Deleting dead session '{}'", "Info".blue(), name.yellow());
+                    cmd!("zellij", "delete-session", name)
+                        .run()
+                        .context("Failed to delete dead session")?;
+                    
+                    // Create a new session
+                    create_session(name)?;
+                } else {
+                    bail!("Session resurrection cancelled");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 fn display_sessions_with_tabs(sessions_with_tabs: Vec<(SessionInfo, Result<Vec<TabInfo>>)>) -> Result<()> {
     if sessions_with_tabs.is_empty() {
         println!("{}", "No active zellij sessions found.".dimmed());
@@ -411,18 +466,36 @@ fn attach_or_switch_session(name: &str, sessions: &[SessionInfo]) -> Result<()> 
 }
 
 fn offer_to_create_session(name: &str) -> Result<()> {
-    println!("{}: Session '{}' does not exist.", "Info".yellow(), name.cyan());
-    print!("Would you like to create it? [Y/n] ");
-    io::stdout().flush()?;
-    
-    let mut response = String::new();
-    io::stdin().read_line(&mut response)?;
-    let response = response.trim().to_lowercase();
-    
-    if response.is_empty() || response == "y" || response == "yes" {
-        create_session(name)?;
+    // First check if there's a dead session with this name
+    if let Some(_dead_session) = check_dead_session(name)? {
+        println!("{}: Session '{}' exists but is dead.", "Info".yellow(), name.cyan());
+        print!("Would you like to resurrect it? [Y/n] ");
+        io::stdout().flush()?;
+        
+        let mut response = String::new();
+        io::stdin().read_line(&mut response)?;
+        let response = response.trim().to_lowercase();
+        
+        if response.is_empty() || response == "y" || response == "yes" {
+            resurrect_dead_session(name)?;
+        } else {
+            println!("Session resurrection cancelled.");
+        }
     } else {
-        println!("Session creation cancelled.");
+        // No dead session found, offer to create a new one
+        println!("{}: Session '{}' does not exist.", "Info".yellow(), name.cyan());
+        print!("Would you like to create it? [Y/n] ");
+        io::stdout().flush()?;
+        
+        let mut response = String::new();
+        io::stdin().read_line(&mut response)?;
+        let response = response.trim().to_lowercase();
+        
+        if response.is_empty() || response == "y" || response == "yes" {
+            create_session(name)?;
+        } else {
+            println!("Session creation cancelled.");
+        }
     }
     
     Ok(())
