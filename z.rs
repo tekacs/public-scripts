@@ -200,6 +200,20 @@ fn list_sessions(include_exited: bool) -> Result<Vec<SessionInfo>> {
     Ok(sessions)
 }
 
+fn get_layout_cwd(layout: &str) -> Option<String> {
+    // Parse KDL and extract the cwd from layout node
+    if let Ok(doc) = layout.parse::<kdl::KdlDocument>() {
+        if let Some(layout_node) = doc.nodes().iter().find(|n| n.name().value() == "layout") {
+            if let Some(cwd_entry) = layout_node.entries().iter().find(|e| e.name().map(|n| n.value()) == Some("cwd")) {
+                if let Some(cwd_val) = cwd_entry.value().as_string() {
+                    return Some(cwd_val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn parse_kdl_layout(layout: &str) -> Result<Vec<TabInfo>> {
     // Parse KDL
     let doc = layout.parse::<kdl::KdlDocument>()
@@ -314,9 +328,30 @@ fn check_dead_session(name: &str) -> Result<Option<SessionInfo>> {
 fn resurrect_dead_session(name: &str) -> Result<()> {
     println!("{}: Resurrecting dead session '{}'", "Info".blue(), name.green());
     
-    // Try to attach to the dead session, which should resurrect it
-    let result = cmd!("zellij", "attach", name)
-        .run();
+    // Try to get the original working directory from the cached layout
+    let original_cwd = match load_cached_session_layout(name) {
+        Ok(layout) => get_layout_cwd(&layout),
+        Err(_) => None,
+    };
+    
+    // If we have an original cwd and it exists, use it for resurrection
+    let result = if let Some(cwd) = &original_cwd {
+        if Path::new(cwd).exists() {
+            println!("{}: Restoring session in original directory: {}", "Info".blue(), cwd.dimmed());
+            // Change to the original directory and resurrect
+            cmd!("zellij", "attach", name)
+                .dir(cwd)
+                .run()
+        } else {
+            println!("{}: Original directory '{}' no longer exists, using current directory", "Warning".yellow(), cwd);
+            cmd!("zellij", "attach", name)
+                .run()
+        }
+    } else {
+        // No cwd found, resurrect in current directory
+        cmd!("zellij", "attach", name)
+            .run()
+    };
     
     match result {
         Ok(_) => Ok(()),
@@ -327,6 +362,9 @@ fn resurrect_dead_session(name: &str) -> Result<()> {
             if active_sessions.iter().any(|s| s.name == name && !s.is_exited) {
                 // Session was successfully resurrected despite the error
                 println!("{}: Session '{}' has been resurrected", "Success".green(), name.green());
+                if let Some(cwd) = original_cwd {
+                    println!("{}: Session restored in: {}", "Info".blue(), cwd.dimmed());
+                }
                 println!("Use '{}' to attach to it", format!("z {}", name).cyan());
                 Ok(())
             } else {
@@ -346,8 +384,17 @@ fn resurrect_dead_session(name: &str) -> Result<()> {
                         .run()
                         .context("Failed to delete dead session")?;
                     
-                    // Create a new session
-                    create_session(name)?;
+                    // Create a new session, optionally in original directory
+                    if let Some(cwd) = original_cwd {
+                        if Path::new(&cwd).exists() {
+                            println!("{}: Creating new session in original directory: {}", "Info".blue(), cwd.dimmed());
+                            create_session_with_cwd(name, &cwd)?;
+                        } else {
+                            create_session(name)?;
+                        }
+                    } else {
+                        create_session(name)?;
+                    }
                 } else {
                     bail!("Session resurrection cancelled");
                 }
@@ -378,6 +425,12 @@ fn display_sessions_with_tabs(sessions_with_tabs: Vec<(SessionInfo, Result<Vec<T
                 "*".green().bold(), 
                 session.name.green().bold(), 
                 "(current)".dimmed()
+            );
+        } else if session.is_exited {
+            println!("{} {} {}", 
+                prefix.yellow().bold(),
+                session.name.red(),
+                "(EXITED)".red().dimmed()
             );
         } else {
             println!("{} {}", 
@@ -516,6 +569,30 @@ fn create_session(name: &str) -> Result<()> {
     } else {
         // Create and attach
         cmd!("zellij", "-s", name)
+            .run()
+            .context("Failed to create session")?;
+    }
+    
+    Ok(())
+}
+
+fn create_session_with_cwd(name: &str, cwd: &str) -> Result<()> {
+    println!("{}: Creating session '{}' in {}", "Info".blue(), name.green(), cwd.dimmed());
+    
+    // Check if we're already in a session
+    if get_current_session().is_some() {
+        // Create detached session in specified directory
+        cmd!("zellij", "-s", name)
+            .dir(cwd)
+            .stderr_null()
+            .stdout_null()
+            .start()?;
+        println!("Session '{}' created. Use '{}' to switch to it.", 
+            name.green(), format!("z {}", name).cyan());
+    } else {
+        // Create and attach in specified directory
+        cmd!("zellij", "-s", name)
+            .dir(cwd)
             .run()
             .context("Failed to create session")?;
     }
