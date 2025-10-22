@@ -538,25 +538,34 @@ fn resume_session_single(saved: &SavedSession, target_session: Option<String>) -
         .status
         .success();
 
-    if !session_exists {
+    let window_id = if !session_exists {
         // Create session with the first window already named to avoid default "zsh" window
         println!("  Creating session {} with window {}", target_session.cyan(), saved.window.yellow());
-        Command::new("tmux")
+        let output = Command::new("tmux")
             .args(&[
                 "new-session",
                 "-d",
                 "-s", &target_session,
                 "-n", &saved.window,
                 "-c", &saved.directory,
+                "-P",  // Print session:window.pane info
             ])
             .output()
             .context("Failed to create tmux session")?;
+
+        if !output.status.success() {
+            bail!("Failed to create session");
+        }
+
+        // Parse output like "0:1.1" to get window index
+        let window_info = String::from_utf8_lossy(&output.stdout);
+        window_info.trim().to_string()
     } else {
         // Session exists, create new window
         // Use "session:" format to avoid confusion with window indices
         let session_target = format!("{}:", target_session);
         println!("  Creating window {}", saved.window.yellow());
-        Command::new("tmux")
+        let output = Command::new("tmux")
             .args(&[
                 "new-window",
                 "-t",
@@ -565,16 +574,25 @@ fn resume_session_single(saved: &SavedSession, target_session: Option<String>) -
                 &saved.window,
                 "-c",
                 &saved.directory,
+                "-P",  // Print session:window.pane info
             ])
             .output()
             .context("Failed to create window")?;
-    }
+
+        if !output.status.success() {
+            bail!("Failed to create window");
+        }
+
+        // Parse output like "0:2.1" to get window index
+        let window_info = String::from_utf8_lossy(&output.stdout);
+        window_info.trim().to_string()
+    };
 
     // Send the resume command
-    let window_target = format!("{}:{}", target_session, saved.window);
+    // Use the exact window ID we got from creating the window
     println!("  Running: {}", saved.resume_command.dimmed());
     Command::new("tmux")
-        .args(&["send-keys", "-t", &window_target, &saved.resume_command, "Enter"])
+        .args(&["send-keys", "-t", &window_id, &saved.resume_command, "Enter"])
         .output()
         .context("Failed to send resume command")?;
 
