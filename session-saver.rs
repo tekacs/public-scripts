@@ -1,0 +1,684 @@
+#!/usr/bin/env scriptr
+---
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+colored = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+dirs = "5"
+---
+
+use clap::{Parser, Subcommand};
+use colored::*;
+use anyhow::{Result, Context, bail};
+use serde::{Deserialize, Serialize};
+use std::fs::{OpenOptions, File};
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
+use regex::Regex;
+
+#[derive(Parser)]
+#[command(about = "Save and resume tmux codex sessions")]
+struct Args {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Save codex sessions (default: all, or specify session[:window])
+    Save {
+        /// Target to save (session or session:window)
+        target: Option<String>,
+    },
+    /// Save already-terminated sessions from scrollback
+    SaveTerminated {
+        /// Target to save (session or session:window)
+        target: Option<String>,
+    },
+    /// List saved sessions
+    List,
+    /// Discover currently running codex sessions
+    Discover {
+        /// Optional target to filter (session or session:window)
+        target: Option<String>,
+    },
+    /// Resume saved sessions (default: all, or specify identifier)
+    Resume {
+        /// Session identifier (window name or substring)
+        identifier: Option<String>,
+        /// Target tmux session to resume in (creates if doesn't exist)
+        #[arg(short = 's', long)]
+        session: Option<String>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedSession {
+    session: String,
+    window: String,
+    directory: String,
+    resume_command: String,
+}
+
+#[derive(Debug)]
+struct TmuxWindow {
+    session: String,
+    window: String,
+    command: String,
+    directory: String,
+}
+
+fn sessions_file() -> PathBuf {
+    dirs::home_dir().unwrap().join("sessions.jsonl")
+}
+
+fn window_exists(session: &str, window: &str) -> Result<bool> {
+    let output = Command::new("tmux")
+        .args(&["list-windows", "-t", session, "-F", "#{window_name}"])
+        .output()?;
+
+    if !output.status.success() {
+        // Session doesn't exist
+        return Ok(false);
+    }
+
+    let windows = String::from_utf8_lossy(&output.stdout);
+    Ok(windows.lines().any(|w| w == window))
+}
+
+fn load_saved_sessions() -> Result<Vec<SavedSession>> {
+    let sessions_file = sessions_file();
+
+    if !sessions_file.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = File::open(&sessions_file).context("Failed to open sessions file")?;
+    let reader = BufReader::new(file);
+
+    let mut sessions = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        if let Ok(session) = serde_json::from_str::<SavedSession>(&line) {
+            sessions.push(session);
+        }
+    }
+
+    Ok(sessions)
+}
+
+fn is_session_saved(session: &str, window: &str) -> Result<bool> {
+    let saved = load_saved_sessions()?;
+    Ok(saved.iter().any(|s| s.session == session && s.window == window))
+}
+
+fn write_session_to_file(session: &SavedSession) -> Result<()> {
+    let sessions_file = sessions_file();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&sessions_file)
+        .context("Failed to open sessions file")?;
+
+    let json = serde_json::to_string(session)?;
+    writeln!(file, "{}", json)?;
+
+    Ok(())
+}
+
+fn run_tmux_command(args: &[&str]) -> Result<String> {
+    let output = Command::new("tmux")
+        .args(args)
+        .output()
+        .context("Failed to run tmux command")?;
+
+    if !output.status.success() {
+        bail!("tmux command failed: {:?}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn list_codex_windows(target_session: Option<&str>, target_window: Option<&str>) -> Result<Vec<TmuxWindow>> {
+    // Get all sessions
+    let sessions_output = run_tmux_command(&["list-sessions", "-F", "#{session_name}"])?;
+    let sessions: Vec<&str> = sessions_output.lines().collect();
+
+    let mut codex_windows = Vec::new();
+
+    for session in sessions {
+        // Skip if we have a target session and this isn't it
+        if let Some(target) = target_session {
+            if session != target {
+                continue;
+            }
+        }
+
+        // List windows for this session
+        let windows_output = run_tmux_command(&[
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            "#{window_name}|#{pane_current_command}|#{pane_current_path}"
+        ])?;
+
+        for line in windows_output.lines() {
+            let parts: Vec<&str> = line.split('|').collect();
+            if parts.len() != 3 {
+                continue;
+            }
+
+            let window = parts[0];
+            let command = parts[1];
+            let directory = parts[2];
+
+            // Skip if we have a target window and this isn't it
+            if let Some(target) = target_window {
+                if window != target {
+                    continue;
+                }
+            }
+
+            // Only include codex windows
+            if command == "codex" {
+                codex_windows.push(TmuxWindow {
+                    session: session.to_string(),
+                    window: window.to_string(),
+                    command: command.to_string(),
+                    directory: directory.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(codex_windows)
+}
+
+fn extract_resume_command(scrollback: &str) -> Option<String> {
+    let re = Regex::new(r"codex resume ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})").unwrap();
+
+    // Search from the end of the scrollback
+    for line in scrollback.lines().rev() {
+        if let Some(captures) = re.captures(line) {
+            if let Some(uuid) = captures.get(1) {
+                return Some(format!("codex resume {}", uuid.as_str()));
+            }
+        }
+    }
+
+    None
+}
+
+fn save_window(window: &TmuxWindow) -> Result<Option<SavedSession>> {
+    let target = format!("{}:{}", window.session, window.window);
+
+    println!("{} Saving {} in session {}",
+        "→".blue(),
+        window.window.yellow(),
+        window.session.cyan()
+    );
+
+    // Send Ctrl-C twice (first cancels any input, second interrupts codex)
+    Command::new("tmux")
+        .args(&["send-keys", "-t", &target, "C-c"])
+        .output()
+        .context("Failed to send first Ctrl-C")?;
+
+    thread::sleep(Duration::from_millis(100));
+
+    Command::new("tmux")
+        .args(&["send-keys", "-t", &target, "C-c"])
+        .output()
+        .context("Failed to send second Ctrl-C")?;
+
+    // Wait for codex to respond
+    thread::sleep(Duration::from_millis(2000));
+
+    // Check if codex is still running
+    let command_output = Command::new("tmux")
+        .args(&["display-message", "-t", &target, "-p", "#{pane_current_command}"])
+        .output()
+        .context("Failed to check running command")?;
+
+    let current_command = String::from_utf8_lossy(&command_output.stdout).trim().to_string();
+
+    if current_command == "codex" {
+        println!("  {} Codex still running after Ctrl-C", "!".yellow());
+    }
+
+    // Capture scrollback
+    let scrollback_output = Command::new("tmux")
+        .args(&["capture-pane", "-p", "-t", &target, "-S", "-50"])
+        .output()
+        .context("Failed to capture scrollback")?;
+
+    let scrollback = String::from_utf8_lossy(&scrollback_output.stdout);
+
+    // Extract resume command
+    if let Some(resume_command) = extract_resume_command(&scrollback) {
+        println!("  {} Found: {}", "✓".green(), resume_command.dimmed());
+
+        Ok(Some(SavedSession {
+            session: window.session.clone(),
+            window: window.window.clone(),
+            directory: window.directory.clone(),
+            resume_command,
+        }))
+    } else {
+        println!("  {} No resume command found", "✗".red());
+        Ok(None)
+    }
+}
+
+fn save_sessions(target: Option<String>) -> Result<()> {
+    // Parse target into session and optional window
+    let (target_session, target_window) = if let Some(target) = target.as_ref() {
+        if let Some((session, window)) = target.split_once(':') {
+            (Some(session), Some(window))
+        } else {
+            (Some(target.as_str()), None)
+        }
+    } else {
+        (None, None)
+    };
+
+    // Find all codex windows
+    let windows = list_codex_windows(target_session, target_window)?;
+
+    if windows.is_empty() {
+        println!("{}", "No codex windows found.".yellow());
+        return Ok(());
+    }
+
+    println!("Found {} codex window(s)\n", windows.len());
+
+    // Save each window
+    let mut saved_count = 0;
+
+    for window in &windows {
+        if let Some(saved) = save_window(window)? {
+            write_session_to_file(&saved)?;
+            saved_count += 1;
+        }
+        println!();
+    }
+
+    println!("{} Saved {} session(s) to {}",
+        "✓".green().bold(),
+        saved_count,
+        sessions_file().display().to_string().dimmed()
+    );
+
+    Ok(())
+}
+
+fn save_terminated_sessions(target: Option<String>) -> Result<()> {
+    // Parse target into session and optional window
+    let (target_session, target_window) = if let Some(target) = target.as_ref() {
+        if let Some((session, window)) = target.split_once(':') {
+            (Some(session), Some(window))
+        } else {
+            (Some(target.as_str()), None)
+        }
+    } else {
+        (None, None)
+    };
+
+    // Get all sessions
+    let sessions_output = run_tmux_command(&["list-sessions", "-F", "#{session_name}"])?;
+    let sessions: Vec<&str> = sessions_output.lines().collect();
+
+    let mut found_windows = Vec::new();
+
+    for session in sessions {
+        // Skip if we have a target session and this isn't it
+        if let Some(target) = target_session {
+            if session != target {
+                continue;
+            }
+        }
+
+        // List windows for this session
+        let windows_output = run_tmux_command(&[
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            "#{window_name}|#{pane_current_command}|#{pane_current_path}"
+        ])?;
+
+        for line in windows_output.lines() {
+            let parts: Vec<&str> = line.split('|').collect();
+            if parts.len() != 3 {
+                continue;
+            }
+
+            let window = parts[0];
+            let command = parts[1];
+            let directory = parts[2];
+
+            // Skip if we have a target window and this isn't it
+            if let Some(target) = target_window {
+                if window != target {
+                    continue;
+                }
+            }
+
+            // Only look at terminated sessions (NOT running codex)
+            if command != "codex" {
+                found_windows.push((session.to_string(), window.to_string(), directory.to_string()));
+            }
+        }
+    }
+
+    if found_windows.is_empty() {
+        println!("{}", "No terminated sessions found.".yellow());
+        return Ok(());
+    }
+
+    println!("Found {} terminated window(s)\n", found_windows.len());
+
+    let mut saved_count = 0;
+    let mut skipped_count = 0;
+
+    for (session, window, directory) in found_windows {
+        // Check if already saved
+        if is_session_saved(&session, &window)? {
+            println!("{} {} in session {} (already saved)",
+                "⊘".dimmed(),
+                window.dimmed(),
+                session.dimmed()
+            );
+            skipped_count += 1;
+            continue;
+        }
+
+        println!("{} Checking {} in session {}",
+            "→".blue(),
+            window.yellow(),
+            session.cyan()
+        );
+
+        // Capture scrollback
+        let target = format!("{}:{}", session, window);
+        let scrollback = run_tmux_command(&["capture-pane", "-p", "-t", &target, "-S", "-100"])?;
+
+        // Extract resume command
+        if let Some(resume_command) = extract_resume_command(&scrollback) {
+            println!("  {} Found: {}", "✓".green(), resume_command.dimmed());
+
+            let saved = SavedSession {
+                session: session.clone(),
+                window: window.clone(),
+                directory: directory.clone(),
+                resume_command,
+            };
+
+            write_session_to_file(&saved)?;
+            saved_count += 1;
+        } else {
+            println!("  {} No resume command found", "✗".red());
+        }
+
+        println!();
+    }
+
+    println!("{} Saved {} session(s), skipped {} (already saved)",
+        "✓".green().bold(),
+        saved_count,
+        skipped_count
+    );
+
+    Ok(())
+}
+
+fn list_saved_sessions() -> Result<()> {
+    let sessions_file = sessions_file();
+
+    if !sessions_file.exists() {
+        println!("{}", "No saved sessions found.".yellow());
+        return Ok(());
+    }
+
+    let file = File::open(&sessions_file).context("Failed to open sessions file")?;
+    let reader = BufReader::new(file);
+
+    println!("{}\n", "Saved sessions:".bold());
+
+    for (i, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<SavedSession>(&line) {
+            Ok(session) => {
+                println!("{:3}. {} {} {}",
+                    (i + 1).to_string().dimmed(),
+                    session.window.yellow().bold(),
+                    format!("({}:{})", session.session, session.window).dimmed(),
+                    session.directory.cyan()
+                );
+                println!("     {}", session.resume_command.dimmed());
+            }
+            Err(_) => {
+                println!("{:3}. {}",
+                    (i + 1).to_string().dimmed(),
+                    "[Invalid entry]".red()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn discover_live_sessions(target: Option<String>) -> Result<()> {
+    // Parse target into session and optional window
+    let (target_session, target_window) = if let Some(target) = target.as_ref() {
+        if let Some((session, window)) = target.split_once(':') {
+            (Some(session), Some(window))
+        } else {
+            (Some(target.as_str()), None)
+        }
+    } else {
+        (None, None)
+    };
+
+    let windows = list_codex_windows(target_session, target_window)?;
+
+    if windows.is_empty() {
+        println!("{}", "No running codex sessions found.".yellow());
+        return Ok(());
+    }
+
+    println!("{}\n", "Running codex sessions:".bold());
+
+    for (i, window) in windows.iter().enumerate() {
+        println!("{:3}. {} {} {}",
+            (i + 1).to_string().dimmed(),
+            window.window.yellow().bold(),
+            format!("({}:{})", window.session, window.window).dimmed(),
+            window.directory.cyan()
+        );
+    }
+
+    println!("\n{}: {}",
+        "Tip".blue(),
+        "Use 'session-saver save <session>:<window>' to save a specific session".dimmed()
+    );
+
+    Ok(())
+}
+
+fn resume_session_single(saved: &SavedSession, target_session: Option<String>) -> Result<()> {
+    let target_session = target_session.unwrap_or_else(|| saved.session.clone());
+
+    println!("{} Resuming {} in session {}",
+        "→".blue(),
+        saved.window.yellow(),
+        target_session.cyan()
+    );
+
+    // Check if session exists
+    let session_exists = Command::new("tmux")
+        .args(&["has-session", "-t", &target_session])
+        .output()?
+        .status
+        .success();
+
+    if !session_exists {
+        // Create session with the first window already named to avoid default "zsh" window
+        println!("  Creating session {} with window {}", target_session.cyan(), saved.window.yellow());
+        Command::new("tmux")
+            .args(&[
+                "new-session",
+                "-d",
+                "-s", &target_session,
+                "-n", &saved.window,
+                "-c", &saved.directory,
+            ])
+            .output()
+            .context("Failed to create tmux session")?;
+    } else {
+        // Session exists, create new window
+        // Use "session:" format to avoid confusion with window indices
+        let session_target = format!("{}:", target_session);
+        println!("  Creating window {}", saved.window.yellow());
+        Command::new("tmux")
+            .args(&[
+                "new-window",
+                "-t",
+                &session_target,
+                "-n",
+                &saved.window,
+                "-c",
+                &saved.directory,
+            ])
+            .output()
+            .context("Failed to create window")?;
+    }
+
+    // Send the resume command
+    let window_target = format!("{}:{}", target_session, saved.window);
+    println!("  Running: {}", saved.resume_command.dimmed());
+    Command::new("tmux")
+        .args(&["send-keys", "-t", &window_target, &saved.resume_command, "Enter"])
+        .output()
+        .context("Failed to send resume command")?;
+
+    println!("{} Session resumed", "✓".green().bold());
+
+    Ok(())
+}
+
+fn resume_sessions(identifier: Option<String>, target_session: Option<String>) -> Result<()> {
+    let saved_sessions = load_saved_sessions()?;
+
+    if saved_sessions.is_empty() {
+        println!("{}", "No saved sessions found.".yellow());
+        return Ok(());
+    }
+
+    let sessions_to_resume = if let Some(id) = identifier {
+        // Find matching sessions
+        let matches: Vec<SavedSession> = saved_sessions
+            .into_iter()
+            .filter(|s| s.window.contains(&id))
+            .collect();
+
+        if matches.is_empty() {
+            bail!("No saved session matching '{}'", id);
+        }
+
+        if matches.len() > 1 {
+            println!("{} Multiple matches found:", "!".yellow());
+            for (i, session) in matches.iter().enumerate() {
+                println!("  {}. {} ({}:{})",
+                    i + 1,
+                    session.window.yellow(),
+                    session.session,
+                    session.window
+                );
+            }
+            bail!("Please be more specific");
+        }
+
+        matches
+    } else {
+        // Resume all sessions
+        saved_sessions
+    };
+
+    println!("Resuming {} session(s)\n", sessions_to_resume.len());
+
+    let mut resumed_count = 0;
+    let mut skipped_count = 0;
+
+    for session in &sessions_to_resume {
+        // Check if window already exists before trying to resume
+        let already_exists = window_exists(
+            &target_session.as_ref().unwrap_or(&session.session),
+            &session.window
+        ).unwrap_or(false);
+
+        if already_exists {
+            println!("{} {} in session {} (already running)",
+                "⊘".dimmed(),
+                session.window.dimmed(),
+                target_session.as_ref().unwrap_or(&session.session).dimmed()
+            );
+            skipped_count += 1;
+        } else {
+            match resume_session_single(session, target_session.clone()) {
+                Ok(_) => resumed_count += 1,
+                Err(e) => {
+                    println!("  {} Failed to resume {}: {}",
+                        "✗".red(),
+                        session.window,
+                        e
+                    );
+                }
+            }
+        }
+        println!();
+    }
+
+    println!("{} Resumed {} session(s), skipped {} (already running)",
+        "✓".green().bold(),
+        resumed_count,
+        skipped_count
+    );
+
+    if resumed_count > 0 {
+        println!("\n{}: {}",
+            "Tip".blue(),
+            "Use 'tmux ls' to see all sessions".dimmed()
+        );
+    }
+
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    match args.command {
+        Commands::Save { target } => save_sessions(target),
+        Commands::SaveTerminated { target } => save_terminated_sessions(target),
+        Commands::List => list_saved_sessions(),
+        Commands::Discover { target } => discover_live_sessions(target),
+        Commands::Resume { identifier, session } => resume_sessions(identifier, session),
+    }
+}
