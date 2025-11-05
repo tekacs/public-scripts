@@ -140,6 +140,69 @@ fn write_session_to_file(session: &SavedSession) -> Result<()> {
     Ok(())
 }
 
+fn extract_session_id_from_resume_command(cmd: &str) -> Option<String> {
+    let re = Regex::new(r"codex\s+resume\s+([0-9a-fA-F-]{36})").ok()?;
+    re.captures(cmd)
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+}
+
+fn write_or_update_session(session: &SavedSession) -> Result<()> {
+    let sessions_path = sessions_file();
+    let sid = extract_session_id_from_resume_command(&session.resume_command)
+        .ok_or_else(|| anyhow::anyhow!("resume command missing session id"))?;
+
+    // If file doesn't exist, just write a fresh line
+    if !sessions_path.exists() {
+        return write_session_to_file(session);
+    }
+
+    let mut lines: Vec<String> = {
+        let f = File::open(&sessions_path).context("open sessions file")?;
+        let r = BufReader::new(f);
+        r.lines().collect::<std::io::Result<Vec<_>>>()?
+    };
+
+    // Find an existing line with the same session id and update it in place
+    let mut updated = false;
+    for line in &mut lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(mut existing) = serde_json::from_str::<SavedSession>(line) {
+            if let Some(existing_sid) =
+                extract_session_id_from_resume_command(&existing.resume_command)
+            {
+                if existing_sid == sid {
+                    // Update the mapping to the new tmux session/window (and directory)
+                    existing.session = session.session.clone();
+                    existing.window = session.window.clone();
+                    existing.directory = session.directory.clone();
+                    *line = serde_json::to_string(&existing)?;
+                    updated = true;
+                }
+            }
+        }
+    }
+
+    if updated {
+        // Overwrite the file with updated contents
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&sessions_path)
+            .context("rewrite sessions file")?;
+        for l in lines {
+            f.write_all(l.as_bytes())?;
+            f.write_all(b"\n")?;
+        }
+        Ok(())
+    } else {
+        // Append as a new entry
+        write_session_to_file(session)
+    }
+}
+
 fn run_tmux_command(args: &[&str]) -> Result<String> {
     let output = Command::new("tmux")
         .args(args)
@@ -416,19 +479,8 @@ fn save_sessions(target: Option<String>) -> Result<()> {
     let mut saved_count = 0;
 
     for window in &windows {
-        if is_session_saved(&window.session, &window.window)? {
-            println!(
-                "{} {} in session {} (already saved)",
-                "⊘".dimmed(),
-                window.window.dimmed(),
-                window.session.dimmed()
-            );
-            println!();
-            continue;
-        }
-
         if let Some(saved) = save_window(window)? {
-            write_session_to_file(&saved)?;
+            write_or_update_session(&saved)?;
             saved_count += 1;
         }
         println!();
@@ -552,7 +604,7 @@ fn save_terminated_sessions(target: Option<String>) -> Result<()> {
                 resume_command,
             };
 
-            write_session_to_file(&saved)?;
+            write_or_update_session(&saved)?;
             saved_count += 1;
         } else {
             println!("  {} No resume command found", "✗".red());
