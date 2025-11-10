@@ -12,7 +12,7 @@ use std::process::Command;
 
 fn main() -> Result<()> {
     let pane = Command::new("tmux")
-        .args(["capture-pane", "-J", "-p"])
+        .args(["capture-pane", "-J", "-p", "-S", "-"])
         .output()
         .context("failed to run `tmux capture-pane`")?;
 
@@ -24,16 +24,16 @@ fn main() -> Result<()> {
     let re = Regex::new(r"\bcodex resume\s+([0-9a-fA-F-]{4,})\b")?;
 
     let command = re
-        .captures(&text)
-        .and_then(|caps| caps.get(0))
-        .map(|m| m.as_str().trim())
+        .captures_iter(&text)
+        .filter_map(|caps| caps.get(0).map(|m| m.as_str().trim().to_owned()))
+        .last()
         .context("no `codex resume <uuid>` line found in the tmux pane")?;
 
     println!("running: {command}");
 
     let status = Command::new("sh")
         .arg("-c")
-        .arg(command)
+        .arg(&command)
         .status()
         .context("failed to spawn command shell")?;
 
