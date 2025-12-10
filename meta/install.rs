@@ -221,16 +221,14 @@ fn install_script(script: &Path, bin_dir: &Path, force: bool, dry_run: bool) -> 
     // Create the symlink
     if !dry_run {
         symlink(script, &link_path)
-            .with_context(|| format!("Failed to create symlink from {} to {}", 
+            .with_context(|| format!("Failed to create symlink from {} to {}",
                 link_path.display(), script.display()))?;
     }
-    
-    if !link_path.is_symlink() || dry_run {
-        println!("   {} {}", 
-            if dry_run { "→" } else { "✓" }.green().bold(), 
-            link_name.bold()
-        );
-    }
+
+    println!("   {} {}",
+        if dry_run { "→" } else { "✓" }.green().bold(),
+        link_name.bold()
+    );
     
     Ok(())
 }
