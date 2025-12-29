@@ -94,6 +94,9 @@ fn get_shell_completion_dir(shell: &str) -> Result<Option<PathBuf>> {
 
 fn find_scripts(repo_dir: &Path, filter: Option<&[String]>) -> Result<Vec<PathBuf>> {
     let mut scripts = Vec::new();
+
+    let installer_script = repo_dir.join("meta").join("install.rs");
+    let installer_script_canon = installer_script.canonicalize().ok();
     
     if let Some(names) = filter {
         // Find specific scripts by name (with or without .rs extension)
@@ -113,6 +116,15 @@ fn find_scripts(repo_dir: &Path, filter: Option<&[String]>) -> Result<Vec<PathBu
             if !path.is_file() {
                 bail!("'{}' is not a file", path.display());
             }
+
+            let is_installer = match (path.canonicalize().ok(), installer_script_canon.as_ref()) {
+                (Some(path_canon), Some(installer_canon)) => path_canon == *installer_canon,
+                _ => path == installer_script,
+            };
+            if is_installer {
+                bail!("Refusing to install {} (installer cannot install itself)", installer_script.display());
+            }
+
             // Check if it's executable
             if let Ok(metadata) = fs::metadata(&path) {
                 use std::os::unix::fs::PermissionsExt;
@@ -134,6 +146,14 @@ fn find_scripts(repo_dir: &Path, filter: Option<&[String]>) -> Result<Vec<PathBu
                     
                     // Only include .rs files that are executable
                     if path.is_file() && path.extension().map_or(false, |e| e == "rs") {
+                        let is_installer = match (path.canonicalize().ok(), installer_script_canon.as_ref()) {
+                            (Some(path_canon), Some(installer_canon)) => path_canon == *installer_canon,
+                            _ => path == installer_script,
+                        };
+                        if is_installer {
+                            continue;
+                        }
+
                         // Check if it's executable
                         if let Ok(metadata) = fs::metadata(&path) {
                             use std::os::unix::fs::PermissionsExt;
